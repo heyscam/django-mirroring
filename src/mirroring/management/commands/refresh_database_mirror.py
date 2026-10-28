@@ -6,20 +6,41 @@ not the product name.
 
 Safe refresh algorithm
 ----------------------
-Load into a **shadow** database first, then cut over so consumers never see a
-half-loaded mirror (same pattern as ``restore_from_mirror``):
+Load into a shadow database first, then cut over so consumers never see a
+half-loaded mirror.
+
+Same-server (``MIRROR_SHADOW_DATABASE_URL`` unset) — the destination role needs
+``CREATEDB``. Heroku Postgres does not grant that, and cannot connect to the
+``postgres`` or ``template1`` databases:
 
 1. Preflight — distinct source and destination URLs.
 2. Recreate shadow ``{destination}_tmp`` on the same cluster (``DROP`` if it
-   already exists, then ``CREATE``) using ``MIRROR_DATABASE_URL`` credentials
-   (must have ``CREATEDB``).
+   already exists, then ``CREATE``) using ``MIRROR_DATABASE_URL`` credentials.
 3. Stream ``pg_dump`` → Dumpling → ``psql`` into the shadow (failure leaves the
    published mirror untouched). Dumpling ``--report`` writes a provenance sidecar.
 4. Post-restore password-hash reset on the shadow.
 5. Migrate the ``mirroring`` app on the shadow and upsert ``MirrorDatabaseState``
    (generation timestamp, source host/db, Dumpling report; ``restored_at`` cleared).
 6. Cutover by rename — terminate connections, rename live mirror → ``*_old_<ts>``,
-   shadow → published name (``MIRROR_DATABASE_URL`` keeps working).
+   shadow → published name (``MIRROR_DATABASE_URL`` keeps working). Drop the
+   retired database.
+
+Heroku (``MIRROR_SHADOW_DATABASE_URL`` set):
+
+1. Preflight, before the dump and on ``--dry-run`` — the shadow URL is a different
+   host/port/database from both the source and the published mirror,
+   ``HEROKU_API_KEY`` is non-empty, and the app name (``MIRROR_HEROKU_APP_NAME``,
+   else ``HEROKU_APP_NAME``) matches ``^[a-z][a-z0-9-]{0,29}$``.
+2. ``--dry-run`` prints the attachment-swap plan and lints Dumpling. It does not
+   reset schema, dump, or call Heroku.
+3. ``--confirm`` resets ``public`` on the shadow addon, streams the dump into it,
+   resets password hashes, migrates ``mirroring``, and writes ``MirrorDatabaseState``.
+   A failure here leaves the published mirror untouched.
+4. Cut over by swapping the ``MIRROR_DATABASE`` and ``MIRROR_SHADOW_DATABASE``
+   attachments. ``DATABASE_URL`` is not changed. Do not ``heroku pg:promote`` and
+   do not PATCH config vars (Heroku owns attachment URLs). Heroku restarts the
+   app when attachments move. The next refresh wipes whichever addon is then
+   ``MIRROR_SHADOW_DATABASE`` and swaps again.
 
 Recommended production topology
 -------------------------------
@@ -29,10 +50,14 @@ Recommended production topology
   writes. Dumping the primary works, but a follower is better practice. Do **not**
   point this at a restricted / allow-listed role that cannot ``SELECT`` customer
   or PII tables — the dump will silently omit them or fail mid-stream.
-* **Published destination** (``MIRROR_DATABASE_URL``) — a Postgres database with
-  ``CREATEDB``. Prefer a **separate** mirror database from the live app primary.
-  Nightly load targets ``{db}_tmp``, then rename cutover replaces the published
-  database name.
+* **Published destination** (``MIRROR_DATABASE_URL``) — the database consumers
+  read. Prefer a **separate** mirror database from the live app primary. When
+  ``MIRROR_SHADOW_DATABASE_URL`` is unset, nightly load targets ``{db}_tmp`` and
+  rename cutover replaces the published database name (role needs ``CREATEDB``).
+* **Heroku shadow addon** (``MIRROR_SHADOW_DATABASE_URL``) — a second Postgres
+  addon on the same major as the source. Refresh loads it, then swaps the
+  ``MIRROR_DATABASE`` attachment onto it. Both addons must be large enough to
+  hold the mirror; they trade places each run.
 
 Trim levers
 -----------
@@ -53,7 +78,8 @@ Endpoints are fixed (no CLI overrides)::
 
     source = MIRROR_SOURCE_DATABASE_URL
     destination = MIRROR_DATABASE_URL
-    shadow = {destination_dbname}_tmp   # derived; drop+recreate each run
+    shadow = {destination_dbname}_tmp    # when MIRROR_SHADOW_DATABASE_URL is unset
+    shadow = MIRROR_SHADOW_DATABASE_URL  # Heroku second addon; attachment swap
 
 Examples::
 
@@ -84,6 +110,12 @@ from django.utils import timezone
 from mirroring.base import BaseMirroringCommand
 from mirroring.database import migrate_database_url, temporary_database_alias
 from mirroring.defaults import auth_user_db_table
+from mirroring.heroku_config import (
+    HerokuConfigError,
+    redact_heroku_error_body,
+    resolve_heroku_app_name,
+    swap_mirror_attachments,
+)
 from mirroring.management.postgres_clone import (
     DumpLineFilter,
     cutover_by_rename,
@@ -114,6 +146,7 @@ SANITIZED_USER_PASSWORD_HASH = (
 ALLOWED_PRODUCTION_ENV = "production"
 SOURCE_URL_ENV = "MIRROR_SOURCE_DATABASE_URL"
 DESTINATION_URL_ENV = "MIRROR_DATABASE_URL"
+SHADOW_URL_ENV = "MIRROR_SHADOW_DATABASE_URL"
 SUBPROCESS_TIMEOUT_SECONDS = 300
 STAFF_USERNAME_KEEP_RULE_MARKER = "# MIRROR_STAFF_USERNAME_KEEP_RULE"
 
@@ -248,10 +281,19 @@ class Command(BaseMirroringCommand):
         src_url = self.require_env_url(SOURCE_URL_ENV)
         dst_url = self.require_env_url(DESTINATION_URL_ENV)
         self.assert_safe_endpoints(src_url, dst_url)
-        try:
-            shadow_name = shadow_database_name(database_name(dst_url))
-        except ValueError as exc:
-            raise CommandError(str(exc)) from exc
+        heroku_shadow_url = self.optional_env_url(SHADOW_URL_ENV)
+        heroku_app_name = ""
+        heroku_api_key = ""
+        if heroku_shadow_url is not None:
+            # Fail before Dumpling or a multi-gigabyte dump, including on --dry-run.
+            self.assert_shadow_distinct(src_url, dst_url, heroku_shadow_url)
+            heroku_app_name, heroku_api_key = self.require_heroku_swap_plan()
+            shadow_name = ""
+        else:
+            try:
+                shadow_name = shadow_database_name(database_name(dst_url))
+            except ValueError as exc:
+                raise CommandError(str(exc)) from exc
 
         config_path = Path(options["config"] or settings.MIRROR_DUMPLING_CONFIG).resolve()
         if not config_path.is_file():
@@ -280,7 +322,17 @@ class Command(BaseMirroringCommand):
         self.render_h1("Refresh database mirror" + (" (dry run)" if dry_run else ""))
         self.info(f"Source ({SOURCE_URL_ENV}):      {self.redact_url(src_url)}")
         self.info(f"Destination ({DESTINATION_URL_ENV}): {self.redact_url(dst_url)}")
-        self.info(f"Shadow: DROP/CREATE {shadow_name!r} on destination server, then rename cutover")
+        if heroku_shadow_url is not None:
+            self.info(f"Shadow ({SHADOW_URL_ENV}): {self.redact_url(heroku_shadow_url)}")
+            self.info(
+                "Cutover: swap Heroku attachments MIRROR_DATABASE and "
+                f"MIRROR_SHADOW_DATABASE on {heroku_app_name}. "
+                "DATABASE_URL is not changed. "
+                "Heroku restarts the app when attachments move. "
+                "The next refresh wipes whichever addon is then MIRROR_SHADOW_DATABASE and swaps again."
+            )
+        else:
+            self.info(f"Shadow: DROP/CREATE {shadow_name!r} on destination server, then rename cutover")
         self.info(f"Dumpling config: {config_path}")
         self.info(f"Exclude schemas: {excluded_schemas or '(none)'}")
         self.info(f"Exclude tables:  {excluded_tables or '(none)'}")
@@ -305,12 +357,117 @@ class Command(BaseMirroringCommand):
                 self.success("Dry run complete — no destination writes.")
                 return
 
-            try:
-                shadow_url = recreate_shadow_database(dst_url, run_checked=self.run_checked)
-            except ValueError as exc:
-                raise CommandError(str(exc)) from exc
-            self.info(f"Recreated shadow database {shadow_name!r}.")
+            if heroku_shadow_url is not None:
+                self._refresh_via_attachment_swap(
+                    src_url=src_url,
+                    dst_url=dst_url,
+                    shadow_url=heroku_shadow_url,
+                    app_name=heroku_app_name,
+                    api_key=heroku_api_key,
+                    dumpling_bin=dumpling_bin,
+                    effective_config=effective_config,
+                    work_dir=work_dir,
+                    excluded_schemas=excluded_schemas,
+                    excluded_tables=excluded_tables,
+                    excluded_table_data=excluded_table_data,
+                    cutoff=cutoff,
+                )
+            else:
+                try:
+                    shadow_url = recreate_shadow_database(dst_url, run_checked=self.run_checked)
+                except ValueError as exc:
+                    raise CommandError(str(exc)) from exc
+                self.info(f"Recreated shadow database {shadow_name!r}.")
 
+                self.reset_destination_schema(shadow_url)
+                dumpling_report = self.stream_dump_through_dumpling(
+                    src_url=src_url,
+                    dst_url=shadow_url,
+                    dumpling_bin=dumpling_bin,
+                    config_path=effective_config,
+                    work_dir=work_dir,
+                    excluded_schemas=excluded_schemas,
+                    excluded_tables=excluded_tables,
+                    excluded_table_data=excluded_table_data,
+                )
+                self.post_restore_fixes(shadow_url)
+                self.record_mirror_generation(
+                    shadow_url,
+                    source_url=src_url,
+                    retain_cutoff=cutoff,
+                    dumpling_report=dumpling_report,
+                )
+
+                try:
+                    retired_name = cutover_by_rename(dst_url, shadow_url, run_checked=self.run_checked)
+                except ValueError as exc:
+                    raise CommandError(str(exc)) from exc
+                shadow_url = None
+                drop_database_if_exists(dst_url, retired_name, run_checked=self.run_checked)
+                self.success(
+                    f"Cut over by rename. Published mirror is again {database_name(dst_url)!r}; "
+                    f"previous mirror {retired_name!r} dropped. "
+                    f"All user passwords are now: {SANITIZED_USER_PASSWORD}"
+                )
+        except Exception:
+            if shadow_url:
+                self.warning(
+                    f"Leaving shadow database {shadow_name!r} in place for inspection ({self.redact_url(shadow_url)})."
+                )
+            raise
+        finally:
+            if options["keep_work_dir"]:
+                self.warning(f"Keeping work dir: {work_dir}")
+            else:
+                shutil.rmtree(work_dir, ignore_errors=True)
+
+    def optional_env_url(self, env_var: str) -> str | None:
+        value = os.environ.get(env_var, "").strip()
+        if not value:
+            return None
+        if urlparse(value).scheme not in {"postgres", "postgresql"}:
+            raise CommandError(f"{env_var} must be a postgres:// or postgresql:// URL.")
+        return value
+
+    def assert_shadow_distinct(self, src_url: str, dst_url: str, shadow_url: str) -> None:
+        shadow_id = database_identity(shadow_url)
+        if shadow_id == database_identity(src_url):
+            raise CommandError(f"{SHADOW_URL_ENV} and {SOURCE_URL_ENV} resolve to the same host/port/database.")
+        if shadow_id == database_identity(dst_url):
+            raise CommandError(f"{SHADOW_URL_ENV} and {DESTINATION_URL_ENV} resolve to the same host/port/database.")
+
+    def require_heroku_swap_plan(self) -> tuple[str, str]:
+        """Validate the Heroku app name and API key before any dump starts."""
+        api_key = os.environ.get("HEROKU_API_KEY", "")
+        if not isinstance(api_key, str) or not api_key.strip():
+            raise CommandError(
+                "HEROKU_API_KEY is not set or empty. "
+                "It is required to swap MIRROR_DATABASE attachments before the dump starts."
+            )
+        try:
+            app_name = resolve_heroku_app_name()
+        except HerokuConfigError as exc:
+            raise CommandError(str(exc)) from exc
+        return app_name, api_key.strip()
+
+    def _refresh_via_attachment_swap(
+        self,
+        *,
+        src_url: str,
+        dst_url: str,
+        shadow_url: str,
+        app_name: str,
+        api_key: str,
+        dumpling_bin: str,
+        effective_config: Path,
+        work_dir: Path,
+        excluded_schemas: list[str],
+        excluded_tables: list[str],
+        excluded_table_data: list[str],
+        cutoff: date | None,
+    ) -> None:
+        """Load the shadow addon, then swap attachments. Rename cutover is not used."""
+        try:
             self.reset_destination_schema(shadow_url)
             dumpling_report = self.stream_dump_through_dumpling(
                 src_url=src_url,
@@ -329,29 +486,28 @@ class Command(BaseMirroringCommand):
                 retain_cutoff=cutoff,
                 dumpling_report=dumpling_report,
             )
-
-            try:
-                retired_name = cutover_by_rename(dst_url, shadow_url, run_checked=self.run_checked)
-            except ValueError as exc:
-                raise CommandError(str(exc)) from exc
-            shadow_url = None
-            drop_database_if_exists(dst_url, retired_name, run_checked=self.run_checked)
-            self.success(
-                f"Cut over by rename. Published mirror is again {database_name(dst_url)!r}; "
-                f"previous mirror {retired_name!r} dropped. "
-                f"All user passwords are now: {SANITIZED_USER_PASSWORD}"
-            )
         except Exception:
-            if shadow_url:
-                self.warning(
-                    f"Leaving shadow database {shadow_name!r} in place for inspection ({self.redact_url(shadow_url)})."
-                )
+            self.warning(
+                "Published mirror left untouched. "
+                f"Shadow addon may be partially loaded ({self.redact_url(shadow_url)})."
+            )
             raise
-        finally:
-            if options["keep_work_dir"]:
-                self.warning(f"Keeping work dir: {work_dir}")
-            else:
-                shutil.rmtree(work_dir, ignore_errors=True)
+        try:
+            swap_mirror_attachments(
+                app_name=app_name,
+                api_key=api_key,
+                published_url=dst_url,
+                shadow_url=shadow_url,
+            )
+        except HerokuConfigError as exc:
+            raise CommandError(redact_heroku_error_body(str(exc), token=api_key)) from None
+        self.success(
+            "Swapped Heroku attachments. MIRROR_DATABASE is the loaded addon and "
+            "MIRROR_SHADOW_DATABASE is the previous mirror. DATABASE_URL was not changed. "
+            "Heroku restarts the app when attachments move. The next refresh wipes whichever "
+            "addon is now MIRROR_SHADOW_DATABASE and swaps again. "
+            f"All user passwords are now: {SANITIZED_USER_PASSWORD}"
+        )
 
     def require_env_url(self, env_var: str) -> str:
         try:

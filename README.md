@@ -2,7 +2,8 @@
 
 Django add-on for production database mirror refresh and staging restore. Uses
 [Dumpling](https://github.com/ababic/dumpling) for in-stream anonymisation and
-Postgres shadow-database cutover so consumers never see a half-loaded mirror.
+Postgres shadow cutover (rename on the same server, or a Heroku attachment swap)
+so consumers never see a half-loaded mirror.
 
 ## Links
 
@@ -39,9 +40,11 @@ or “safe” targets — **you** choose which URLs and buckets are written.
 Architecture once configured:
 
 ```text
-production follower ──pg_dump──► Dumpling ──► mirror DB (prod addon)
+production follower ──pg_dump──► Dumpling ──► shadow addon (MIRROR_SHADOW_DATABASE)
                                               │
-                         restore_from_mirror ──┘──► staging primary
+                         attachment swap ─────┘──► published mirror (MIRROR_DATABASE)
+                         DATABASE_URL is not changed
+                         restore_from_mirror ──► staging primary
                          sync_referenced_media ──► staging media bucket
 ```
 
@@ -79,25 +82,55 @@ MIRROR_RESTORE_STAFF_EMAIL_DOMAINS = mirror_policy.mirror_restore_staff_email_do
 
 ### 2. Mirror database (production)
 
-#### Provision the mirror database
+#### Provision two mirror addons (Heroku)
 
-Create a **separate** Postgres addon on the production app (not a fork of live
-data for day-to-day use — refresh will replace its contents nightly). The role
-behind `MIRROR_DATABASE_URL` needs **`CREATEDB`** (shadow load + rename cutover).
+Heroku Postgres roles have `rolcreatedb = false` and cannot connect to the
+`postgres` or `template1` databases, so refresh cannot `CREATE DATABASE`.
+Provision a **published** addon and a **shadow** addon, both on the same major
+as the follower. Heroku’s default for a new addon is 18, and a 15 client cannot
+dump an 18 server — pass `--version=15` (or the follower’s major).
 
 ```bash
-# Example: empty Standard-0 on the production app (adjust plan as needed)
+# Example: empty Standard-0 addons (adjust the plan — both must fit a full mirror;
+# they trade places on every refresh)
 heroku addons:create heroku-postgresql:standard-0 \
+  --version=15 \
   -a your-app-production \
   --as MIRROR_DATABASE
 
+heroku addons:create heroku-postgresql:standard-0 \
+  --version=15 \
+  -a your-app-production \
+  --as MIRROR_SHADOW_DATABASE
+
 heroku pg:wait -a your-app-production
-heroku config:get MIRROR_DATABASE_URL -a your-app-production
 ```
 
-Heroku will set `MIRROR_DATABASE_URL` when you use `--as MIRROR_DATABASE`. If you
-attach under another colour name, copy that URL into `MIRROR_DATABASE_URL`
-yourself.
+`--as` sets `MIRROR_DATABASE_URL` and `MIRROR_SHADOW_DATABASE_URL`. Refresh loads
+the shadow addon, then swaps the `MIRROR_DATABASE` attachment onto it. The
+previous mirror becomes `MIRROR_SHADOW_DATABASE` and is wiped on the next run.
+Heroku restarts the app when attachments move.
+
+Do **not** cut over with `heroku pg:promote`. That replaces `DATABASE_URL` (the
+live primary). This command does not PATCH config vars — Heroku owns attachment
+URLs and rewrites them when attachments move. The only swapped pair is
+`MIRROR_DATABASE` / `MIRROR_SHADOW_DATABASE`.
+
+On a Postgres you administer yourself, leave `MIRROR_SHADOW_DATABASE_URL` unset.
+Refresh then creates `{destination}_tmp` on the destination server and cuts over
+by rename. That role needs `CREATEDB`, which Heroku does not grant.
+
+#### Platform API token
+
+Attachment swap needs a token that can manage addon attachments on the app.
+Setting the config var restarts the app. Dynos already have `HEROKU_APP_NAME`;
+set `MIRROR_HEROKU_APP_NAME` only to override it (it wins).
+
+```bash
+heroku config:set HEROKU_API_KEY="..." -a your-app-production
+# Optional override of HEROKU_APP_NAME:
+heroku config:set MIRROR_HEROKU_APP_NAME=your-app-production -a your-app-production
+```
 
 #### Point the dump source at a full-access follower
 
@@ -116,8 +149,10 @@ heroku pg:wait -a your-app-production
 heroku config:get MIRROR_SOURCE_DATABASE_URL -a your-app-production
 ```
 
-Do **not** use a restricted / allow-listed read role (missing `SELECT` on PII
-tables) as the dump source — the dump will be incomplete or fail.
+A follower matches the primary’s major. Pin both mirror addons to that major
+(`--version=15`, or the follower’s major). Do **not** use a restricted /
+allow-listed read role (missing `SELECT` on PII tables) as the dump source —
+the dump will be incomplete or fail.
 
 #### Exclude noisy / non-portable table data
 
@@ -174,7 +209,11 @@ heroku run python manage.py refresh_database_mirror --dry-run -a your-app-produc
 heroku run python manage.py refresh_database_mirror --confirm -a your-app-production
 ```
 
-Schedule `refresh_database_mirror` nightly on production once dry-runs look good.
+`--dry-run` prints the attachment-swap plan and lints Dumpling. It does not reset
+schema, dump, or call the Heroku API. `--confirm` loads the shadow addon and
+swaps attachments. `DATABASE_URL` is not changed — do not use `heroku pg:promote`.
+Expect a dyno restart when the attachments move. Schedule
+`refresh_database_mirror` nightly on production once dry-runs look good.
 
 #### Read-only URL for staging (store on production for safekeeping)
 
@@ -294,7 +333,9 @@ MEDIA_SYNC_ALLOW=1 heroku run \
 ### 5. Checklist
 
 - [ ] `mirroring` installed, migrated, admin watermark visible
-- [ ] Production: `MIRROR_SOURCE_DATABASE_URL` (follower), `MIRROR_DATABASE_URL` (CREATEDB)
+- [ ] Production: `MIRROR_SOURCE_DATABASE_URL` (follower) and `MIRROR_DATABASE_URL`
+- [ ] Heroku: `MIRROR_SHADOW_DATABASE_URL` on the same Postgres major (`--version=15` or the follower’s major), `HEROKU_API_KEY` (can manage attachments), and `MIRROR_HEROKU_APP_NAME` when the dyno app name is not the swap target
+- [ ] Heroku cutover swaps `MIRROR_DATABASE` / `MIRROR_SHADOW_DATABASE` — not `heroku pg:promote` (`DATABASE_URL` stays the primary)
 - [ ] Production: Dumpling TOML + `DUMPLING_GLOBAL_SALT` + exclude/retain lists
 - [ ] Production: nightly `refresh_database_mirror`
 - [ ] Production: `MIRROR_DATABASE_READONLY_URL` (+ optional media source IAM) stored
@@ -346,6 +387,9 @@ wire env → settings in one place).
 |---------------|---------|
 | `MIRROR_SOURCE_DATABASE_URL` | `pg_dump` source (prefer a full-access follower/replica) |
 | `MIRROR_DATABASE_URL` | Published mirror database (destination for refresh; source for restore) |
+| `MIRROR_SHADOW_DATABASE_URL` | Second Heroku Postgres addon. When set, refresh loads it and swaps the `MIRROR_DATABASE` attachment onto it. Unset keeps same-server `CREATE DATABASE` + rename cutover |
+| `MIRROR_HEROKU_APP_NAME` | App whose attachments are swapped. When set, wins over `HEROKU_APP_NAME` |
+| `HEROKU_API_KEY` | Platform API token used only to swap `MIRROR_DATABASE` and `MIRROR_SHADOW_DATABASE`. Required when the shadow URL is set |
 | `MIRROR_DATABASE_READONLY_URL` | *(convention)* read-only mirror URL stored on production for staging to copy — not read by this package |
 | `MIRROR_DUMPLING_CONFIG` | Path to project Dumpling TOML (required for refresh) |
 | `MIRROR_EXCLUDED_SCHEMA` | Schemas omitted from dump (default: none — set in host settings) |
@@ -375,8 +419,14 @@ hostname allow/block list in the package:
   refresh load does not compete with live writes. Dumping the primary is allowed
   but not recommended under load.
 - Prefer pointing `MIRROR_DATABASE_URL` at a **separate** mirror database from the
-  live app primary. The destination role needs `CREATEDB` for shadow load + rename
-  cutover.
+  live app primary.
+- On Heroku, also set `MIRROR_SHADOW_DATABASE_URL` to a second addon on the same
+  major (`--version=15` or the follower’s major). Refresh loads that addon and
+  swaps the `MIRROR_DATABASE` attachment. Do not `heroku pg:promote` — that
+  replaces `DATABASE_URL`. Heroku restarts the app when attachments move.
+  Heroku roles cannot `CREATE DATABASE`.
+- When `MIRROR_SHADOW_DATABASE_URL` is unset, the destination role needs
+  `CREATEDB` for `{db}_tmp` plus rename cutover on the same server.
 - Point `MIRROR_RESTORE_TARGET_DATABASE_URL` only at a disposable staging (or
   equivalent) database you intend to replace.
 - A restricted / allow-listed role that cannot `SELECT` PII tables will produce an
@@ -390,7 +440,7 @@ hostname allow/block list in the package:
 
 | Command | Role |
 |---------|------|
-| `refresh_database_mirror` | Nightly production job: dump follower → Dumpling → shadow DB → rename cutover |
+| `refresh_database_mirror` | Nightly production job: dump follower → Dumpling → shadow, then rename cutover or (Heroku) attachment swap |
 | `restore_from_mirror` | Replace staging from the mirror via shadow load + rename cutover |
 | `revert_mirror_restore` | Swap `{target}_preswap` back after a restore |
 | `sync_referenced_media` | After restore: copy DB-referenced S3 keys from a source bucket into `AWS_STORAGE_BUCKET_NAME` |

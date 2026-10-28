@@ -133,6 +133,7 @@ def test_refresh_database_mirror_blocks_non_production(settings: SettingsWrapper
 @pytest.mark.unit
 def test_refresh_database_mirror_refuses_same_src_and_dst(settings: SettingsWrapper, monkeypatch: MonkeyPatch) -> None:
     settings.ENV = "production"
+    monkeypatch.delenv("MIRROR_SHADOW_DATABASE_URL", raising=False)
     monkeypatch.setenv("MIRROR_SOURCE_DATABASE_URL", "postgres://u:p@db.example:5432/live")
     monkeypatch.setenv("MIRROR_DATABASE_URL", "postgres://u:p@db.example:5432/live")
     monkeypatch.setenv("DUMPLING_GLOBAL_SALT", "unit-test-salt")
@@ -151,6 +152,7 @@ def test_refresh_database_mirror_dry_run_lints_policy(
     )
     settings.MIRROR_DUMPLING_CONFIG = config
 
+    monkeypatch.delenv("MIRROR_SHADOW_DATABASE_URL", raising=False)
     monkeypatch.setenv("MIRROR_SOURCE_DATABASE_URL", "postgres://u:p@follower.example:5432/src")
     monkeypatch.setenv("MIRROR_DATABASE_URL", "postgres://u:p@dst.example:5432/dst")
     monkeypatch.setenv("DUMPLING_GLOBAL_SALT", "unit-test-salt")
@@ -176,6 +178,7 @@ def test_refresh_database_mirror_dry_run_lints_policy(
 @pytest.mark.unit
 def test_refresh_database_mirror_drops_retired_database(settings: SettingsWrapper, monkeypatch: MonkeyPatch) -> None:
     settings.ENV = "production"
+    monkeypatch.delenv("MIRROR_SHADOW_DATABASE_URL", raising=False)
     monkeypatch.setenv("MIRROR_SOURCE_DATABASE_URL", "postgres://u:p@follower.example:5432/src")
     monkeypatch.setenv("MIRROR_DATABASE_URL", "postgres://u:p@dst.example:5432/dst")
     monkeypatch.setenv("DUMPLING_GLOBAL_SALT", "unit-test-salt")
@@ -212,3 +215,176 @@ def test_shadow_database_name_is_target_plus_tmp() -> None:
 
     assert shadow_database_name("reskinned_inventory") == "reskinned_inventory_tmp"
     assert shadow_database_name("Mirror-DB") == "mirror_db_tmp"
+
+
+@pytest.mark.unit
+def test_refresh_dry_run_with_shadow_url_prints_swap_plan(settings: SettingsWrapper, monkeypatch: MonkeyPatch) -> None:
+    settings.ENV = "production"
+    monkeypatch.setenv("MIRROR_SOURCE_DATABASE_URL", "postgres://u:source-secret@follower.example:5432/src")
+    monkeypatch.setenv("MIRROR_DATABASE_URL", "postgres://u:dest-secret@mirror.example:5432/mirrordb")
+    monkeypatch.setenv("MIRROR_SHADOW_DATABASE_URL", "postgres://u:shadow-secret@shadow.example:5432/shadowdb")
+    monkeypatch.setenv("HEROKU_API_KEY", "heroku-test-key")
+    monkeypatch.setenv("MIRROR_HEROKU_APP_NAME", "reskinned-warehouse-production")
+    monkeypatch.setenv("HEROKU_APP_NAME", "some-other-app")
+    monkeypatch.setenv("DUMPLING_GLOBAL_SALT", "unit-test-salt")
+
+    with (
+        patch("mirroring.management.commands.refresh_database_mirror.require_dumpling", return_value="dumpling"),
+        patch("mirroring.management.commands.refresh_database_mirror.require_postgres_clients"),
+        patch("mirroring.management.commands.refresh_database_mirror.subprocess.run") as run_mock,
+        patch("mirroring.management.commands.refresh_database_mirror.swap_mirror_attachments") as swap_mock,
+        patch("mirroring.management.commands.refresh_database_mirror.recreate_shadow_database") as recreate_mock,
+        patch.object(RefreshCommand, "reset_destination_schema") as reset_mock,
+        patch.object(RefreshCommand, "stream_dump_through_dumpling") as stream_mock,
+    ):
+        run_mock.return_value = MagicMock(returncode=0, stderr="", stdout="")
+        out = StringIO()
+        call_command("refresh_database_mirror", "--dry-run", stdout=out)
+
+    output = out.getvalue()
+    assert "DATABASE_URL is not changed" in output
+    assert "DROP/CREATE" not in output
+    assert "swap" in output
+    assert "shadow-secret" not in output
+    assert "heroku-test-key" not in output
+    assert "Heroku restarts the app when attachments move" in output
+    swap_mock.assert_not_called()
+    recreate_mock.assert_not_called()
+    reset_mock.assert_not_called()
+    stream_mock.assert_not_called()
+    lint_cmd = run_mock.call_args.args[0]
+    assert lint_cmd[0] == "dumpling"
+    assert "lint-policy" in lint_cmd
+
+
+@pytest.mark.unit
+def test_refresh_confirm_with_shadow_url_swaps_attachments(settings: SettingsWrapper, monkeypatch: MonkeyPatch) -> None:
+    settings.ENV = "production"
+    shadow_url = "postgres://u:shadow-secret@shadow.example:5432/shadowdb"
+    monkeypatch.setenv("MIRROR_SOURCE_DATABASE_URL", "postgres://u:source-secret@follower.example:5432/src")
+    monkeypatch.setenv("MIRROR_DATABASE_URL", "postgres://u:dest-secret@mirror.example:5432/mirrordb")
+    monkeypatch.setenv("MIRROR_SHADOW_DATABASE_URL", shadow_url)
+    monkeypatch.setenv("HEROKU_API_KEY", "heroku-test-key")
+    monkeypatch.setenv("MIRROR_HEROKU_APP_NAME", "reskinned-warehouse-production")
+    monkeypatch.setenv("DUMPLING_GLOBAL_SALT", "unit-test-salt")
+
+    order: list[str] = []
+
+    def stream(**kwargs: object) -> dict[str, str]:
+        order.append("stream")
+        assert kwargs["dst_url"] == shadow_url
+        return {"dumpling_version": "0.9.0"}
+
+    with (
+        patch("mirroring.management.commands.refresh_database_mirror.require_dumpling", return_value="dumpling"),
+        patch("mirroring.management.commands.refresh_database_mirror.require_postgres_clients"),
+        patch("mirroring.management.commands.refresh_database_mirror.recreate_shadow_database") as recreate_mock,
+        patch("mirroring.management.commands.refresh_database_mirror.cutover_by_rename") as cutover_mock,
+        patch("mirroring.management.commands.refresh_database_mirror.drop_database_if_exists") as drop_mock,
+        patch(
+            "mirroring.management.commands.refresh_database_mirror.swap_mirror_attachments",
+            side_effect=lambda **kwargs: order.append("swap"),
+        ) as swap_mock,
+        patch.object(RefreshCommand, "lint_dumpling_policy"),
+        patch.object(
+            RefreshCommand,
+            "reset_destination_schema",
+            side_effect=lambda *args, **kwargs: order.append("reset"),
+        ),
+        patch.object(RefreshCommand, "stream_dump_through_dumpling", side_effect=stream),
+        patch.object(
+            RefreshCommand,
+            "post_restore_fixes",
+            side_effect=lambda *args, **kwargs: order.append("post"),
+        ),
+        patch.object(
+            RefreshCommand,
+            "record_mirror_generation",
+            side_effect=lambda *args, **kwargs: order.append("record"),
+        ),
+    ):
+        out = StringIO()
+        call_command("refresh_database_mirror", "--confirm", stdout=out)
+
+    assert order == ["reset", "stream", "post", "record", "swap"]
+    recreate_mock.assert_not_called()
+    cutover_mock.assert_not_called()
+    drop_mock.assert_not_called()
+    swap_mock.assert_called_once()
+    assert swap_mock.call_args.kwargs["app_name"] == "reskinned-warehouse-production"
+    assert swap_mock.call_args.kwargs["api_key"] == "heroku-test-key"
+    assert swap_mock.call_args.kwargs["published_url"].endswith("@mirror.example:5432/mirrordb")
+    assert swap_mock.call_args.kwargs["shadow_url"] == shadow_url
+    output = out.getvalue()
+    assert "heroku-test-key" not in output
+    assert "shadow-secret" not in output
+    assert "DATABASE_URL was not changed" in output
+    assert "Heroku restarts the app when attachments move" in output
+
+
+@pytest.mark.unit
+def test_refresh_shadow_url_equal_to_source_raises(settings: SettingsWrapper, monkeypatch: MonkeyPatch) -> None:
+    settings.ENV = "production"
+    monkeypatch.setenv("MIRROR_SOURCE_DATABASE_URL", "postgres://u:p@follower.example:5432/src")
+    monkeypatch.setenv("MIRROR_SHADOW_DATABASE_URL", "postgresql://other:secret@follower.example:5432/src")
+    monkeypatch.setenv("MIRROR_DATABASE_URL", "postgres://u:p@mirror.example:5432/mirrordb")
+    monkeypatch.setenv("HEROKU_API_KEY", "heroku-test-key")
+    monkeypatch.setenv("DUMPLING_GLOBAL_SALT", "unit-test-salt")
+    with (
+        patch("mirroring.management.commands.refresh_database_mirror.require_dumpling") as dumpling_mock,
+        pytest.raises(CommandError, match="MIRROR_SHADOW_DATABASE_URL and MIRROR_SOURCE_DATABASE_URL"),
+    ):
+        call_command("refresh_database_mirror", "--dry-run", stdout=StringIO())
+    dumpling_mock.assert_not_called()
+
+
+@pytest.mark.unit
+def test_refresh_shadow_url_equal_to_destination_raises(settings: SettingsWrapper, monkeypatch: MonkeyPatch) -> None:
+    settings.ENV = "production"
+    monkeypatch.setenv("MIRROR_SOURCE_DATABASE_URL", "postgres://u:p@follower.example:5432/src")
+    monkeypatch.setenv("MIRROR_DATABASE_URL", "postgres://u:p@mirror.example:5432/mirrordb")
+    monkeypatch.setenv("MIRROR_SHADOW_DATABASE_URL", "postgresql://other:secret@mirror.example:5432/mirrordb")
+    with (
+        patch("mirroring.management.commands.refresh_database_mirror.require_dumpling") as dumpling_mock,
+        pytest.raises(CommandError, match="MIRROR_SHADOW_DATABASE_URL and MIRROR_DATABASE_URL"),
+    ):
+        call_command("refresh_database_mirror", "--confirm", stdout=StringIO())
+    dumpling_mock.assert_not_called()
+
+
+@pytest.mark.unit
+def test_refresh_shadow_url_requires_heroku_api_key_before_dumpling(
+    settings: SettingsWrapper, monkeypatch: MonkeyPatch
+) -> None:
+    settings.ENV = "production"
+    monkeypatch.delenv("HEROKU_API_KEY", raising=False)
+    monkeypatch.setenv("MIRROR_SOURCE_DATABASE_URL", "postgres://u:p@follower.example:5432/src")
+    monkeypatch.setenv("MIRROR_DATABASE_URL", "postgres://u:p@mirror.example:5432/mirrordb")
+    monkeypatch.setenv("MIRROR_SHADOW_DATABASE_URL", "postgres://u:p@shadow.example:5432/shadowdb")
+    monkeypatch.setenv("MIRROR_HEROKU_APP_NAME", "warehouse-prod")
+    monkeypatch.setenv("DUMPLING_GLOBAL_SALT", "unit-test-salt")
+    with (
+        patch("mirroring.management.commands.refresh_database_mirror.require_dumpling") as dumpling_mock,
+        patch("mirroring.management.commands.refresh_database_mirror.swap_mirror_attachments") as swap_mock,
+        pytest.raises(CommandError, match="HEROKU_API_KEY"),
+    ):
+        call_command("refresh_database_mirror", "--dry-run", stdout=StringIO())
+    dumpling_mock.assert_not_called()
+    swap_mock.assert_not_called()
+
+
+@pytest.mark.unit
+def test_refresh_unsafe_app_name_raises_before_dumpling(settings: SettingsWrapper, monkeypatch: MonkeyPatch) -> None:
+    settings.ENV = "production"
+    monkeypatch.setenv("MIRROR_SOURCE_DATABASE_URL", "postgres://u:p@follower.example:5432/src")
+    monkeypatch.setenv("MIRROR_DATABASE_URL", "postgres://u:p@mirror.example:5432/mirrordb")
+    monkeypatch.setenv("MIRROR_SHADOW_DATABASE_URL", "postgres://u:p@shadow.example:5432/shadowdb")
+    monkeypatch.setenv("HEROKU_API_KEY", "heroku-test-key")
+    monkeypatch.setenv("MIRROR_HEROKU_APP_NAME", "app/../../other")
+    monkeypatch.setenv("HEROKU_APP_NAME", "warehouse-prod")
+    with (
+        patch("mirroring.management.commands.refresh_database_mirror.require_dumpling") as dumpling_mock,
+        pytest.raises(CommandError, match=r"app/\.\./\.\./other"),
+    ):
+        call_command("refresh_database_mirror", "--dry-run", stdout=StringIO())
+    dumpling_mock.assert_not_called()

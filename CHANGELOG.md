@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `refresh_database_mirror` can load a second Heroku Postgres addon
+  (`MIRROR_SHADOW_DATABASE_URL`) and cut over by swapping the `MIRROR_DATABASE`
+  attachment. Heroku roles cannot `CREATE DATABASE` or connect to `postgres` /
+  `template1`. `DATABASE_URL` is never changed. Rename cutover is unchanged when
+  the shadow URL is unset.
+
 ## [0.2.4] - 2026-08-18
 
 ### Added
